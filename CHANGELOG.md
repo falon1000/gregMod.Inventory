@@ -10,6 +10,14 @@ Format: [Keep a Changelog](https://keepachangelog.com/de/1.0.0/). Version: see [
 
 ## [Unreleased]
 
+### Fixed
+
+- Restore no longer drops the payload one-shot when a delivering mod (prefab
+  provider) is not ready yet: it retries up to 120 s, keeps restored slots,
+  adopts previously restored objects back instead of duplicating/leaking them,
+  and only then drops with a warning naming the missing prefab IDs.
+  Unparseable payloads still drop immediately.
+
 ### Added
 
 - Save persistence via gregCore (`GregSaveGuard` sidecar `gregMod.Inventory`):

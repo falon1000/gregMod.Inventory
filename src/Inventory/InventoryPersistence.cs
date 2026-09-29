@@ -36,6 +36,13 @@ namespace GregModInventory
 
         private static string _pendingPayload;
 
+        // Retry state: a restore that fails only because a delivering mod
+        // (prefab provider) is not ready yet must not drop the payload.
+        // Parse errors drop immediately (retry cannot help those).
+        private static int _spawnAttempts;
+        private static float _spawnFirstAttemptAtRealtime;
+        private const float MaxSpawnRetrySeconds = 120f;
+
         // Call ONLY if GregHost.HasCore is true!
         public static void RegisterWithCore()
         {
@@ -53,7 +60,17 @@ namespace GregModInventory
         {
             if (string.IsNullOrWhiteSpace(payload)) return;
             _pendingPayload = payload;
+            _spawnAttempts = 0;
+            _spawnFirstAttemptAtRealtime = 0f;
             MelonLogger.Msg($"[Inventory] Save payload parked ({payload.Length} chars).");
+        }
+
+        private static void DropPayload(string reason)
+        {
+            _pendingPayload = null;
+            _spawnAttempts = 0;
+            _spawnFirstAttemptAtRealtime = 0f;
+            MelonLogger.Warning("[Inventory] Restore payload dropped: " + reason);
         }
 
         // Call every frame from Core.OnUpdate (vanilla-only, standalone-safe).
@@ -65,16 +82,47 @@ namespace GregModInventory
             var shop = mgm != null ? mgm.computerShop : null;
             if (shop == null) return;
 
-            string payload = _pendingPayload;
-            _pendingPayload = null; // One-shot: no endless retry.
+            // Unparseable payloads can never succeed — drop immediately.
+            if (!TryParse(_pendingPayload, out _, out var probe) || probe.Count == 0)
+            {
+                DropPayload("empty/invalid (parse failed).");
+                return;
+            }
+
+            if (_spawnFirstAttemptAtRealtime <= 0f)
+            {
+                try { _spawnFirstAttemptAtRealtime = UnityEngine.Time.realtimeSinceStartup; } catch { }
+                MelonLogger.Msg("[Inventory] Restoring save payload...");
+            }
+            _spawnAttempts++;
+
+            List<string> unresolved = null;
             try
             {
-                SpawnFromPayload(shop, payload);
+                SpawnFromPayload(shop, _pendingPayload, out unresolved);
             }
             catch (Exception ex)
             {
-                MelonLogger.Error($"[Inventory] Restore failed: {ex.GetBaseException().Message}");
+                MelonLogger.Error($"[Inventory] Restore attempt {_spawnAttempts} failed: {ex.GetBaseException().Message}");
             }
+
+            if (unresolved == null || unresolved.Count == 0)
+            {
+                _pendingPayload = null;
+                _spawnAttempts = 0;
+                _spawnFirstAttemptAtRealtime = 0f;
+                return;
+            }
+
+            float elapsed = 0f;
+            try { elapsed = UnityEngine.Time.realtimeSinceStartup - _spawnFirstAttemptAtRealtime; } catch { }
+            if (elapsed >= MaxSpawnRetrySeconds)
+            {
+                DropPayload($"still unresolved after {MaxSpawnRetrySeconds:0}s " +
+                    $"(missing prefab provider mod?): {string.Join("; ", unresolved.ToArray())}. " +
+                    "Restored slots stay; install/enable the delivering mod and reload to recover the rest.");
+            }
+            // else: keep payload for the next frames (provider may appear late).
         }
 
         // ── Serialize ────────────────────────────────────────────────────
@@ -191,8 +239,9 @@ namespace GregModInventory
         }
 
         [System.Diagnostics.CodeAnalysis.ExcludeFromCodeCoverage(Justification = "Live Il2Cpp/Unity interop against game assemblies; needs running game.")]
-        private static void SpawnFromPayload(Il2Cpp.ComputerShop shop, string payload)
+        private static void SpawnFromPayload(Il2Cpp.ComputerShop shop, string payload, out List<string> unresolved)
         {
+            unresolved = new List<string>();
             if (!TryParse(payload, out int active, out var descs) || descs.Count == 0)
             {
                 MelonLogger.Warning("[Inventory] Payload empty/invalid — nothing to restore.");
@@ -200,7 +249,11 @@ namespace GregModInventory
             }
 
             // Collect own objects (sweep guard), then clear slots.
+            // Previously restored objects join the adoption pool FIRST so a
+            // retry adopts them back instead of duplicating (fresh spawn) or
+            // leaking (excluded as owned but never re-homed) them.
             var owned = new HashSet<int>();
+            var pool = new List<GameObject>();
             for (int i = 0; i < Inventory.MaxSlots; i++)
             {
                 var slot = Inventory.Slots[i];
@@ -209,6 +262,7 @@ namespace GregModInventory
                 {
                     if (go == null) continue;
                     try { owned.Add(go.GetInstanceID()); } catch { }
+                    pool.Add(go);
                 }
                 Inventory.Slots[i] = null;
             }
@@ -216,6 +270,9 @@ namespace GregModInventory
             // Strays: unparented UsableObjects above threshold that are
             // not ours (e.g. vanilla restore of our old stash).
             var strays = CollectStrays(owned);
+            // Own pool first (priority), then strays.
+            for (int i = pool.Count - 1; i >= 0; i--)
+                strays.Insert(0, pool[i]);
 
             int restored = 0;
             foreach (var d in descs)
@@ -274,7 +331,13 @@ namespace GregModInventory
                         }
                     }
 
-                    if (gos.Count == 0) continue;
+                    if (gos.Count == 0)
+                    {
+                        unresolved.Add($"slot {d.SlotIndex}: id={d.PrefabID} type={d.TypeInt} (0/{d.Count})");
+                        continue;
+                    }
+                    if (gos.Count < d.Count)
+                        unresolved.Add($"slot {d.SlotIndex}: id={d.PrefabID} type={d.TypeInt} ({gos.Count}/{d.Count})");
 
                     // Apply cable state to all spinners.
                     foreach (var go in gos)
