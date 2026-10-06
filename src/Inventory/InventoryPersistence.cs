@@ -304,7 +304,8 @@ namespace GregModInventory
                         {
                             if (gos.Count >= d.Count) break;
                             gos.Add(near);
-                            try { owned.Add(near.GetInstanceID()); } catch { }
+                            try { owned.Add(near.GetInstanceID()); }
+                            catch { /* destroyed Il2Cpp object: nothing to exclude from later passes */ }
                         }
                     }
 
@@ -413,12 +414,8 @@ namespace GregModInventory
                     Inventory.Slots[d.SlotIndex] = slot;
                     restored++;
 
-                    try
-                    {
-                        MelonLogger.Msg($"[Inventory] Slot {d.SlotIndex} restored: '{displayName}' " +
-                            $"prefabID={d.PrefabID} count={gos.Count} icon={(icon != null ? "yes" : "no")}.");
-                    }
-                    catch { }
+                    MelonLogger.Msg($"[Inventory] Slot {d.SlotIndex} restored: '{displayName}' " +
+                        $"prefabID={d.PrefabID} count={gos.Count} icon={(icon != null ? "yes" : "no")}.");
                 }
                 catch (Exception ex)
                 {
@@ -472,10 +469,10 @@ namespace GregModInventory
                         if (dist > HandAdoptRadius) continue;
                         result.Add((go, dist));
                     }
-                    catch { }
+                    catch { /* object destroyed mid-scan (Il2Cpp throws on collected objects): skip it */ }
                 }
             }
-            catch { }
+            catch { /* best-effort: no adoption, the caller spawns a fresh item instead */ }
             result.Sort((a, b) => a.dist.CompareTo(b.dist));
             var list = new List<GameObject>();
             foreach (var r in result) list.Add(r.go);
