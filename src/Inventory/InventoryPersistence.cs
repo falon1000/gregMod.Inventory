@@ -293,20 +293,22 @@ namespace GregModInventory
                     }
 
                     // 1b) The slot that was in hand at save time: the vanilla save
-                    // also records held items, restoring them loose at the hand
-                    // position (with their real state, e.g. a custom cable color).
-                    // Adopt those instead of spawning a default copy — otherwise
-                    // the player gets a duplicate, and the one in hand is the
-                    // default-colored fresh clone.
-                    if (d.SlotIndex == active && gos.Count < d.Count)
+                    // also records the held item and restores it loose at the hand
+                    // position, so the player got a duplicate. Adopting that copy
+                    // doesn't work — its own Start() hasn't run yet and runs later
+                    // in hand, which left it broken (it vanished). Delete it and
+                    // spawn our own copy below; rgbColor etc. come from the payload.
+                    if (d.SlotIndex == active)
                     {
-                        foreach (var near in CollectNearPlayer(owned, d.PrefabID))
+                        int removed = 0;
+                        foreach (var dup in FindHeldDuplicates(owned, d))
                         {
-                            if (gos.Count >= d.Count) break;
-                            gos.Add(near);
-                            try { owned.Add(near.GetInstanceID()); }
-                            catch { /* destroyed Il2Cpp object: nothing to exclude from later passes */ }
+                            if (removed >= d.Count) break;
+                            try { UnityEngine.Object.Destroy(dup); removed++; }
+                            catch { /* already destroyed: nothing to remove */ }
                         }
+                        if (removed > 0)
+                            MelonLogger.Msg($"[Inventory] Removed {removed} vanilla duplicate(s) of the held item.");
                     }
 
                     // 2) Spawn rest fresh (prefab lookup via shop).
@@ -440,42 +442,68 @@ namespace GregModInventory
                 MelonLogger.Msg($"[Inventory] Cleaned up {destroyed} homeless stash stray(s).");
 
             Inventory.ActiveSlot = active;
+            // Every slot was stashed above, including the one that was in hand;
+            // Core.OnUpdate puts it back in hand once gameplay is live.
+            Inventory.PendingEquip = true;
+            Inventory.PendingEquipAt = Time.unscaledTime + 1f;
             MelonLogger.Msg($"[Inventory] Restore done: {restored}/{descs.Count} slot(s).");
         }
 
         private const float HandAdoptRadius = 2.5f;
 
-        // Loose, unparented items with this prefabID close to the player's
-        // camera, nearest first. Trolley/rack items are parented, so excluded.
-        private static List<GameObject> CollectNearPlayer(HashSet<int> owned, int prefabID)
+        // The vanilla load parents restored loose items under a "UsableObjects"
+        // container, so "no parent" alone missed them. Anything else with a parent
+        // (trolley cargo, racks, a hand) is not a loose item.
+        private static bool IsLooseWorldItem(GameObject go)
         {
-            var result = new List<(GameObject go, float dist)>();
+            var parent = go.transform.parent;
+            return parent == null || parent.name == "UsableObjects";
+        }
+
+        // Vanilla copies of the held item. Cable reels are matched by their exact
+        // saved length/in-use values (camera position isn't reliable during the
+        // first load); other items by distance to the camera, nearest first.
+        private static List<GameObject> FindHeldDuplicates(HashSet<int> owned, SlotDesc d)
+        {
+            var exact = new List<(GameObject go, float dist)>();
+            var near = new List<(GameObject go, float dist)>();
             try
             {
                 var cam = Camera.main;
-                if (cam == null) return new List<GameObject>();
-                Vector3 eye = cam.transform.position;
                 var all = UnityEngine.Object.FindObjectsOfType<UsableObject>();
-                if (all == null) return new List<GameObject>();
-                foreach (var u in all)
+                if (all != null)
                 {
-                    try
+                    foreach (var u in all)
                     {
-                        if (u == null || u.prefabID != prefabID) continue;
-                        var go = u.gameObject;
-                        if (go == null || go.transform.parent != null) continue;
-                        if (owned.Contains(go.GetInstanceID())) continue;
-                        float dist = Vector3.Distance(go.transform.position, eye);
-                        if (dist > HandAdoptRadius) continue;
-                        result.Add((go, dist));
+                        try
+                        {
+                            if (u == null || u.prefabID != d.PrefabID) continue;
+                            var go = u.gameObject;
+                            if (go == null || !IsLooseWorldItem(go)) continue;
+                            if (owned.Contains(go.GetInstanceID())) continue;
+                            float dist = cam != null
+                                ? Vector3.Distance(go.transform.position, cam.transform.position)
+                                : float.MaxValue;
+                            var spinner = go.GetComponent<CableSpinner>();
+                            if (spinner != null &&
+                                Mathf.Abs(spinner.cableLenght - d.Len) < 0.01f &&
+                                Mathf.Abs(spinner.cableLenghtInUse - d.InUse) < 0.01f)
+                                exact.Add((go, dist));
+                            else if (dist <= HandAdoptRadius)
+                                near.Add((go, dist));
+                        }
+                        catch { /* object destroyed mid-scan (Il2Cpp throws on collected objects): skip it */ }
                     }
-                    catch { /* object destroyed mid-scan (Il2Cpp throws on collected objects): skip it */ }
                 }
             }
-            catch { /* best-effort: no adoption, the caller spawns a fresh item instead */ }
-            result.Sort((a, b) => a.dist.CompareTo(b.dist));
+            catch { /* best-effort: worst case the vanilla duplicate stays in the world */ }
+            // Exact (same length/in-use) matches first, nearest first — so a spare
+            // identical spool elsewhere loses to the copy at the hand position.
+            exact.Sort((a, b) => a.dist.CompareTo(b.dist));
+            near.Sort((a, b) => a.dist.CompareTo(b.dist));
             var list = new List<GameObject>();
-            foreach (var r in result) list.Add(r.go);
+            foreach (var e in exact) list.Add(e.go);
+            foreach (var n in near) list.Add(n.go);
             return list;
         }
 

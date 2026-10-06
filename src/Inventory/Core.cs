@@ -47,6 +47,7 @@ namespace GregModInventory
                 // is really done" signal, which is what we actually need.
                 SaveSystem.onLoadingDataLater += (SaveSystem.OnLoadingDataLater)(System.Action)(() =>
                 {
+                    ResetInputCache();
                     try { InventoryPersistence.TrySpawnPending(); }
                     catch (System.Exception ex2) { LoggerInstance.Warning($"onLoadingDataLater restore failed: {ex2.Message}"); }
                 });
@@ -71,6 +72,15 @@ namespace GregModInventory
             if (!pm.enabledPlayerMovement) return;
 
             Inventory.CleanupSlots();
+
+            Inventory.WatchEquip();
+
+            if (Inventory.PendingEquip && Time.unscaledTime >= Inventory.PendingEquipAt)
+            {
+                Inventory.PendingEquip = false;
+                try { Inventory.EquipActiveSlot(); }
+                catch (System.Exception ex) { LoggerInstance.Warning($"Re-equip of active slot failed: {ex.Message}"); }
+            }
 
             // NOTE: restore is intentionally NOT polled here anymore. This ran
             // every frame gated only on "shop is ready", which becomes true
@@ -98,6 +108,12 @@ namespace GregModInventory
                         Inventory.HandIcon = Inventory.GetItemIcon(tmp);
                     }
                 }
+            }
+
+            if (HandItemsFromInventory && Inventory.HandIcon == null && Inventory.IconRetryFrames > 0)
+            {
+                Inventory.IconRetryFrames--;
+                Inventory.TryCaptureHandIcon();
             }
 
             // Handle drop for inventory-restored items.
@@ -175,7 +191,14 @@ namespace GregModInventory
             }
 
             if (_dropAction != null)
+            {
+                // Only called while holding inventory items. The game disables
+                // Drop whenever the hand is empty (e.g. during load), and
+                // EnsureDropActionEnabled is a no-op until the action is cached
+                // here — so an item re-equipped on load could never be dropped.
+                if (!_dropAction.enabled) _dropAction.Enable();
                 return _dropAction.WasPressedThisFrame();
+            }
 
             return false;
         }
@@ -220,6 +243,17 @@ namespace GregModInventory
             // Re-enable Drop action — DropObject() disables it (nothing in hand),
             // but we need it active for future inventory drops.
             EnsureDropActionEnabled();
+        }
+
+        /// <summary>
+        /// Forget the cached Drop action and InputController. A save load creates
+        /// a new InputController; the cached action from before the load never
+        /// reports a press again, so restored items couldn't be dropped.
+        /// </summary>
+        internal static void ResetInputCache()
+        {
+            if (Instance != null) Instance._dropAction = null;
+            CachedInputCtrl = null;
         }
 
         /// <summary>
@@ -271,6 +305,7 @@ namespace GregModInventory
     {
         static void Postfix()
         {
+            Core.ResetInputCache();
             try { InventoryPersistence.TrySpawnPending(); }
             catch (System.Exception ex) { MelonLogger.Warning($"[Inventory] Post-Load restore failed: {ex.Message}"); }
         }
@@ -289,6 +324,7 @@ namespace GregModInventory
     {
         static void Postfix()
         {
+            Core.ResetInputCache();
             try { InventoryPersistence.TrySpawnPending(); }
             catch (System.Exception ex) { MelonLogger.Warning($"[Inventory] Post-LoadNetworkState restore failed: {ex.Message}"); }
         }
