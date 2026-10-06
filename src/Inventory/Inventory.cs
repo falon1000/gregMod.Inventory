@@ -42,10 +42,10 @@ namespace GregModInventory
         /// during the load the hand position isn't usable yet, so equipping
         /// right away left the item invisible until the next slot switch.
         /// </summary>
-        public static bool PendingEquip;
+        internal static bool PendingEquip { get; set; }
 
         /// <summary>Earliest time (unscaled) the pending re-equip may run.</summary>
-        public static float PendingEquipAt;
+        internal static float PendingEquipAt { get; set; }
 
         /// <summary>
         /// Put the active slot's items into the player's hand if the hand is empty.
@@ -104,7 +104,7 @@ namespace GregModInventory
         }
 
         /// <summary>Frames left to retry capturing HandIcon after a re-equip.</summary>
-        public static int IconRetryFrames;
+        internal static int IconRetryFrames { get; set; }
 
         /// <summary>One icon capture attempt from the objects in hand.</summary>
         public static void TryCaptureHandIcon()
