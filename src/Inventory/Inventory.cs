@@ -215,7 +215,12 @@ namespace GregModInventory
             for (int i = 0; i < MaxSlots; i++)
             {
                 if (Slots[i] != null && Slots[i].IsEmpty())
+                {
+                    MelonLoader.MelonLogger.Warning(
+                        $"[Inventory] CleanupSlots: slot {i} ('{Slots[i].DisplayName}') emptied — " +
+                        "its stored GameObject(s) were destroyed/null.");
                     Slots[i] = null;
+                }
             }
         }
     }

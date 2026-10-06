@@ -89,12 +89,53 @@ namespace GregModInventory
                 {
                     try
                     {
+                        GameObject[] objects;
+                        int typeInt;
+                        int prefabID;
+
                         var slot = Inventory.Slots[i];
-                        if (slot == null || slot.IsEmpty()) continue;
+                        if (slot != null && !slot.IsEmpty())
+                        {
+                            objects = slot.StoredObjects;
+                            typeInt = (int)slot.ItemType;
+                            prefabID = slot.PrefabID;
+                        }
+                        else if (i == Inventory.ActiveSlot)
+                        {
+                            // The active slot's item isn't in Slots[] while it's
+                            // equipped (RestoreSlotItems clears it on switch) — it's
+                            // live in the player's hand instead. Read it straight from
+                            // PlayerManager so saving while holding your hotbar item
+                            // doesn't silently drop it.
+                            var pm = PlayerManager.instance;
+                            if (pm == null || pm.objectInHand == PlayerManager.ObjectInHand.None) continue;
+                            var handArray = pm.objectInHandGO;
+                            if (handArray == null) continue;
+
+                            var liveObjects = new List<GameObject>();
+                            int livePrefab = -1;
+                            foreach (var go in handArray)
+                            {
+                                if (go == null) continue;
+                                liveObjects.Add(go);
+                                if (livePrefab < 0)
+                                {
+                                    var u = go.GetComponent<UsableObject>();
+                                    if (u != null) livePrefab = u.prefabID;
+                                }
+                            }
+                            if (liveObjects.Count == 0) continue;
+
+                            objects = liveObjects.ToArray();
+                            typeInt = (int)pm.objectInHand;
+                            prefabID = livePrefab;
+                        }
+                        else continue;
 
                         int alive = 0;
                         float len = 0f, inUse = 0f, ctype = 0f;
-                        foreach (var go in slot.StoredObjects)
+                        string rgb = "";
+                        foreach (var go in objects)
                         {
                             if (go == null) continue;
                             alive++;
@@ -108,6 +149,7 @@ namespace GregModInventory
                                         len = spinner.cableLenght;
                                         inUse = spinner.cableLenghtInUse;
                                         ctype = spinner.cableType;
+                                        rgb = spinner.rgbColor ?? "";
                                     }
                                 }
                                 catch { }
@@ -117,12 +159,14 @@ namespace GregModInventory
 
                         slotParts.Add(string.Join(",",
                             i.ToString(CultureInfo.InvariantCulture),
-                            ((int)slot.ItemType).ToString(CultureInfo.InvariantCulture),
-                            slot.PrefabID.ToString(CultureInfo.InvariantCulture),
+                            typeInt.ToString(CultureInfo.InvariantCulture),
+                            prefabID.ToString(CultureInfo.InvariantCulture),
                             alive.ToString(CultureInfo.InvariantCulture),
                             len.ToString("R", CultureInfo.InvariantCulture),
                             inUse.ToString("R", CultureInfo.InvariantCulture),
-                            ctype.ToString("R", CultureInfo.InvariantCulture)));
+                            ctype.ToString("R", CultureInfo.InvariantCulture),
+                            // Base64: the color string may itself contain separators.
+                            rgb.Length > 0 ? Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(rgb)) : ""));
                     }
                     catch { }
                 }
@@ -146,6 +190,7 @@ namespace GregModInventory
             public float Len;
             public float InUse;
             public float CType;
+            public string RgbColor = "";
         }
 
         private static bool TryParse(string payload, out int active, out List<SlotDesc> slots)
@@ -167,7 +212,10 @@ namespace GregModInventory
                         foreach (var s in body.Split('|'))
                         {
                             var f = s.Split(',');
-                            if (f.Length != 7) continue;
+                            // 8th field: base64 CableSpinner.rgbColor (optional; older
+                            // saves have 7 fields, or a non-base64 value from an
+                            // earlier experiment, which is ignored).
+                            if (f.Length != 7 && f.Length != 8) continue;
                             var d = new SlotDesc();
                             if (!int.TryParse(f[0], NumberStyles.Integer, CultureInfo.InvariantCulture, out d.SlotIndex)) continue;
                             if (!int.TryParse(f[1], NumberStyles.Integer, CultureInfo.InvariantCulture, out d.TypeInt)) continue;
@@ -176,6 +224,11 @@ namespace GregModInventory
                             if (!float.TryParse(f[4], NumberStyles.Float, CultureInfo.InvariantCulture, out d.Len)) continue;
                             if (!float.TryParse(f[5], NumberStyles.Float, CultureInfo.InvariantCulture, out d.InUse)) continue;
                             if (!float.TryParse(f[6], NumberStyles.Float, CultureInfo.InvariantCulture, out d.CType)) continue;
+                            if (f.Length == 8 && f[7].Length > 0)
+                            {
+                                try { d.RgbColor = System.Text.Encoding.UTF8.GetString(Convert.FromBase64String(f[7])); }
+                                catch { d.RgbColor = ""; }
+                            }
                             if (d.SlotIndex < 0 || d.SlotIndex >= Inventory.MaxSlots) continue;
                             if (d.Count <= 0) continue;
                             slots.Add(d);
@@ -239,6 +292,22 @@ namespace GregModInventory
                         }
                     }
 
+                    // 1b) The slot that was in hand at save time: the vanilla save
+                    // also records held items, restoring them loose at the hand
+                    // position (with their real state, e.g. a custom cable color).
+                    // Adopt those instead of spawning a default copy — otherwise
+                    // the player gets a duplicate, and the one in hand is the
+                    // default-colored fresh clone.
+                    if (d.SlotIndex == active && gos.Count < d.Count)
+                    {
+                        foreach (var near in CollectNearPlayer(owned, d.PrefabID))
+                        {
+                            if (gos.Count >= d.Count) break;
+                            gos.Add(near);
+                            try { owned.Add(near.GetInstanceID()); } catch { }
+                        }
+                    }
+
                     // 2) Spawn rest fresh (prefab lookup via shop).
                     GameObject prefab = null;
                     if (gos.Count < d.Count)
@@ -264,6 +333,24 @@ namespace GregModInventory
                                     var fresh = UnityEngine.Object.Instantiate(prefab);
                                     if (fresh == null) break;
                                     fresh.SetActive(false);
+                                    // Move to the stash position (world space, no
+                                    // parent) BEFORE anything below briefly activates
+                                    // it for icon capture. Left at the prefab's raw
+                                    // spawn point, a loose active item sitting in
+                                    // normal play space can get caught by a native
+                                    // cleanup sweep (observed: destroyed ~1s later).
+                                    fresh.transform.SetParent(null, false);
+                                    fresh.transform.position = InventorySlot.StashPosition;
+                                    // The prefab's own authored LOCAL transform is meant
+                                    // for sitting in a rack/shop display, not for being
+                                    // held — InventorySlot captures local position/
+                                    // rotation as the "hand pose" below, so the raw
+                                    // prefab's values would put a held item somewhere
+                                    // odd (sometimes right in front of the camera).
+                                    // Centering it gives every restored item the same
+                                    // sane default once it's parented to the hand.
+                                    fresh.transform.localPosition = Vector3.zero;
+                                    fresh.transform.localRotation = Quaternion.identity;
                                     gos.Add(fresh);
                                 }
                                 catch { break; }
@@ -284,6 +371,15 @@ namespace GregModInventory
                                 spinner.cableLenght = d.Len;
                                 spinner.cableLenghtInUse = d.InUse;
                                 spinner.cableType = (int)d.CType;
+                                // The game applies rgbColor from the reel's own Start(),
+                                // which never runs here because the slot stashes
+                                // (deactivates) the item first — apply it now.
+                                string rgb = !string.IsNullOrEmpty(d.RgbColor) ? d.RgbColor : spinner.rgbColor;
+                                if (!string.IsNullOrEmpty(rgb) && ColorUtility.TryParseHtmlString(rgb, out var col))
+                                {
+                                    try { spinner.ApplyColor(col, rgb); }
+                                    catch (Exception ex) { MelonLogger.Warning($"[Inventory] ApplyColor failed: {ex.Message}"); }
+                                }
                             }
                         }
                         catch { }
@@ -316,6 +412,13 @@ namespace GregModInventory
                     slot.Stash();
                     Inventory.Slots[d.SlotIndex] = slot;
                     restored++;
+
+                    try
+                    {
+                        MelonLogger.Msg($"[Inventory] Slot {d.SlotIndex} restored: '{displayName}' " +
+                            $"prefabID={d.PrefabID} count={gos.Count} icon={(icon != null ? "yes" : "no")}.");
+                    }
+                    catch { }
                 }
                 catch (Exception ex)
                 {
@@ -341,6 +444,42 @@ namespace GregModInventory
 
             Inventory.ActiveSlot = active;
             MelonLogger.Msg($"[Inventory] Restore done: {restored}/{descs.Count} slot(s).");
+        }
+
+        private const float HandAdoptRadius = 2.5f;
+
+        // Loose, unparented items with this prefabID close to the player's
+        // camera, nearest first. Trolley/rack items are parented, so excluded.
+        private static List<GameObject> CollectNearPlayer(HashSet<int> owned, int prefabID)
+        {
+            var result = new List<(GameObject go, float dist)>();
+            try
+            {
+                var cam = Camera.main;
+                if (cam == null) return new List<GameObject>();
+                Vector3 eye = cam.transform.position;
+                var all = UnityEngine.Object.FindObjectsOfType<UsableObject>();
+                if (all == null) return new List<GameObject>();
+                foreach (var u in all)
+                {
+                    try
+                    {
+                        if (u == null || u.prefabID != prefabID) continue;
+                        var go = u.gameObject;
+                        if (go == null || go.transform.parent != null) continue;
+                        if (owned.Contains(go.GetInstanceID())) continue;
+                        float dist = Vector3.Distance(go.transform.position, eye);
+                        if (dist > HandAdoptRadius) continue;
+                        result.Add((go, dist));
+                    }
+                    catch { }
+                }
+            }
+            catch { }
+            result.Sort((a, b) => a.dist.CompareTo(b.dist));
+            var list = new List<GameObject>();
+            foreach (var r in result) list.Add(r.go);
+            return list;
         }
 
         private static List<GameObject> CollectStrays(HashSet<int> owned)

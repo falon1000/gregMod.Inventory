@@ -37,6 +37,25 @@ namespace GregModInventory
             {
                 LoggerInstance.Warning($"Sidecar registration failed: {ex.Message}");
             }
+
+            try
+            {
+                // SaveSystem.Load() itself returns long before loading is truly
+                // finished (it's a multi-frame/async process — Harmony-postfixing
+                // Load() directly still raced its own internal "clear loose
+                // equipment" sweep). onLoadingDataLater is the game's own "loading
+                // is really done" signal, which is what we actually need.
+                SaveSystem.onLoadingDataLater += (SaveSystem.OnLoadingDataLater)(System.Action)(() =>
+                {
+                    try { InventoryPersistence.TrySpawnPending(); }
+                    catch (System.Exception ex2) { LoggerInstance.Warning($"onLoadingDataLater restore failed: {ex2.Message}"); }
+                });
+            }
+            catch (System.Exception ex)
+            {
+                LoggerInstance.Warning($"onLoadingDataLater hook failed: {ex.Message}");
+            }
+
             LoggerInstance.Msg("gregMod.Inventory v1.1.0 loaded. Based on Inventory by leoms1408.");
         }
 
@@ -53,8 +72,13 @@ namespace GregModInventory
 
             Inventory.CleanupSlots();
 
-            // Save restore from gregCore sidecar (no-op without payload/core).
-            InventoryPersistence.TrySpawnPending();
+            // NOTE: restore is intentionally NOT polled here anymore. This ran
+            // every frame gated only on "shop is ready", which becomes true
+            // long before the world/network finishes loading — so it always
+            // won the race against the SaveSystem.Load / LoadNetworkState
+            // postfix hooks below, restoring items while native loading was
+            // still mid-cleanup and getting them destroyed moments later.
+            // TrySpawnPending() now fires only from those two postfixes.
 
             // Render icon for freshly picked-up items (not from our inventory)
             if (!HandItemsFromInventory)
@@ -229,6 +253,44 @@ namespace GregModInventory
             if (__instance.objectInHands) return true;
             if (__instance.transform.position.y < 1000f) return true;
             return false;
+        }
+    }
+
+    /// <summary>
+    /// SaveSystem.Load (the pause-menu load path) does its own "clear loose
+    /// equipment from the scene" sweep as part of loading. Restoring our
+    /// hotbar on a per-frame OnUpdate poll can land mid-Load, before that
+    /// internal sweep runs, so the native cleanup destroys our freshly
+    /// spawned item seconds later. Running the restore in a postfix here
+    /// guarantees it happens strictly after Load() (and its sweep) is done.
+    /// Kept as a (harmless, idempotent) safety net even though the real fix
+    /// turned out to be WaypointInitializationSystem.LoadNetworkState below.
+    /// </summary>
+    [HarmonyPatch(typeof(SaveSystem), nameof(SaveSystem.Load))]
+    static class SaveSystem_Load_Patch
+    {
+        static void Postfix()
+        {
+            try { InventoryPersistence.TrySpawnPending(); }
+            catch (System.Exception ex) { MelonLogger.Warning($"[Inventory] Post-Load restore failed: {ex.Message}"); }
+        }
+    }
+
+    /// <summary>
+    /// The true last step of loading ("Evaluating network" on the loading
+    /// screen) — confirmed via a Destroy() call-stack trace that pointed
+    /// here, not at SaveSystem.Load itself. gregCore already postfixes this
+    /// same native method for its own (non-destructive) device inventory
+    /// scan, which is how it was identified. Restoring strictly after this
+    /// returns is the earliest point that's actually safe.
+    /// </summary>
+    [HarmonyPatch(typeof(WaypointInitializationSystem), "LoadNetworkState")]
+    static class WaypointInitializationSystem_LoadNetworkState_Patch
+    {
+        static void Postfix()
+        {
+            try { InventoryPersistence.TrySpawnPending(); }
+            catch (System.Exception ex) { MelonLogger.Warning($"[Inventory] Post-LoadNetworkState restore failed: {ex.Message}"); }
         }
     }
 }
